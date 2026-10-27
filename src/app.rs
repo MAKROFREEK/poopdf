@@ -36,23 +36,22 @@ pub struct PdfApp {
     zoom: Zoom,
     scroll_y: f32,
     cache: PageCache<TextureHandle>,
-    /// File name currently shown in the window title.
-    titled: Option<String>,
+    /// File name most recently applied to the window title.
+    last_applied_title: Option<String>,
 }
 
 impl PdfApp {
     /// Provision pdfium once, then create the app. A CLI path opens the
     /// Document immediately; on failure we show the error in-app.
-    pub fn new(start_path: Option<String>) -> Result<Self, String> {
-        let pdfium = pdfium_lib::bind_pinned_pdfium().map_err(|e| e.to_string())?;
-        let mut app = Self {
+    pub fn new(start_path: Option<String>) -> Result<Self, pdfium_lib::BindError> {
+        let pdfium = pdfium_lib::bind_pinned_pdfium()?;        let mut app = Self {
             pdfium,
             document: None,
             error: None,
             zoom: Zoom::default(),
             scroll_y: 0.0,
             cache: PageCache::new(DEFAULT_BUDGET_BYTES),
-            titled: None,
+            last_applied_title: None,
         };
         if let Some(path) = start_path {
             app.open_document(Path::new(&path));
@@ -68,7 +67,9 @@ impl PdfApp {
                 self.error = None;
                 self.zoom = Zoom::default();
                 self.scroll_y = 0.0;
-                self.cache.invalidate_zoom(self.zoom.factor());
+                // The cached bitmaps belong to the previous Document; drop
+                // all of them, not just other zooms.
+                self.cache.clear();
             }
             Err(e) => self.error = Some(format!("Could not open {}: {e}", path.display())),
         }
@@ -133,6 +134,20 @@ impl eframe::App for PdfApp {
         let viewport = Self::viewport_size(ctx);
 
         ctx.input(|i| {
+            // Shift is part of typing `+`/`_`/text; it must not disable
+            // plain keys. Ctrl/Alt/Command mean shortcuts (Ctrl+wheel, and
+            // keybinds arriving in later tickets).
+            let unmodified = !(i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command);
+            if !unmodified {
+                if i.modifiers.ctrl && i.smooth_scroll_delta.y != 0.0 {
+                    // Ctrl+wheel zooms, anchored at the viewport center.
+                    self.apply_zoom(self.zoom.wheel(i.smooth_scroll_delta.y).factor(), viewport);
+                }
+                return;
+            }
+
+            self.scroll_y -= i.smooth_scroll_delta.y;
+
             for event in &i.events {
                 if let Event::Key {
                     key,
@@ -141,7 +156,7 @@ impl eframe::App for PdfApp {
                     ..
                 } = event
                 {
-                    if *modifiers != egui::Modifiers::default() {
+                    if modifiers.ctrl || modifiers.alt || modifiers.command {
                         continue;
                     }
                     match key {
@@ -154,33 +169,11 @@ impl eframe::App for PdfApp {
                         Key::Num0 => self.apply_zoom(self.zoom.reset().factor(), viewport),
                         Key::O => self.open_with_picker(),
                         Key::Q => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        _ => {}
-                    }
-                }
-            }
-
-            if i.modifiers.ctrl && i.smooth_scroll_delta.y != 0.0 {
-                // Ctrl+wheel zooms, anchored at the viewport center.
-                self.apply_zoom(self.zoom.wheel(i.smooth_scroll_delta.y).factor(), viewport);
-            } else {
-                self.scroll_y -= i.smooth_scroll_delta.y;
-            }
-
-            for event in &i.events {
-                if let Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    if *modifiers != egui::Modifiers::default() {
-                        continue;
-                    }
-                    let step = viewport.y * 0.5;
-                    match key {
-                        Key::ArrowDown => self.scroll_y += step,
-                        Key::ArrowUp => self.scroll_y -= step,
+                        // Arrows scroll half a viewport; the spec reserves
+                        // `j`/`k`/arrows for the Paragraph Cursor (later
+                        // tickets), so this stays scroll-only.
+                        Key::ArrowDown => self.scroll_y += viewport.y * 0.5,
+                        Key::ArrowUp => self.scroll_y -= viewport.y * 0.5,
                         _ => {}
                     }
                 }
@@ -205,8 +198,8 @@ impl eframe::App for PdfApp {
                 )
             })
             .unwrap_or_else(|| "poopdf".to_string());
-        if self.titled.as_deref() != Some(&wanted_title) {
-            self.titled = Some(wanted_title.clone());
+        if self.last_applied_title.as_deref() != Some(&wanted_title) {
+            self.last_applied_title = Some(wanted_title.clone());
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(wanted_title));
         }
@@ -232,7 +225,7 @@ impl eframe::App for PdfApp {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("poopdf");
-                        ui.label("Press `o` to open a PDF");
+                        ui.label("Press `o` to choose a PDF to read");
                     });
                 });
                 return;
@@ -269,7 +262,7 @@ impl eframe::App for PdfApp {
                                 [bitmap.width as usize, bitmap.height as usize],
                                 &bitmap.rgba,
                             );
-                            let texture = ctx_of(ui).load_texture(
+                            let texture = ui.ctx().load_texture(
                                 format!("page-{page_i}-zoom-{}", zoom),
                                 image,
                                 egui::TextureOptions::LINEAR,
@@ -307,8 +300,4 @@ impl eframe::App for PdfApp {
             }
         });
     }
-}
-
-fn ctx_of(ui: &mut egui::Ui) -> egui::Context {
-    ui.ctx().clone()
 }

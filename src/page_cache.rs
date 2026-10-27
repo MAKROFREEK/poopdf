@@ -101,6 +101,14 @@ impl<V> PageCache<V> {
         self.evict_until_within_budget();
     }
 
+    /// Drop every cached bitmap, freeing its bytes. Dropping a texture
+    /// handle also frees the GPU-side copy.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.byte_count = 0;
+    }
+
     /// Drop every bitmap that was not rendered at `zoom_factor` (zoom
     /// changed, so all of them are stale at the new scale).
     pub fn invalidate_zoom(&mut self, zoom_factor: f32) {
@@ -116,7 +124,7 @@ impl<V> PageCache<V> {
         }
     }
 
-    /// Total cost of cached entries in bytes.
+    /// Evict least-recently-used entries until the byte budget holds.
     fn evict_until_within_budget(&mut self) {
         while self.byte_count > self.max_bytes {
             let Some(oldest) = self.order.front().copied() else {
@@ -191,6 +199,28 @@ mod tests {
         assert_eq!(cache.get(key(0)), Some(&0));
         assert_eq!(cache.get(key(1)), None);
         assert_eq!(cache.get(key(2)), Some(&2));
+    }
+
+    #[test]
+    fn invalidating_the_current_zoom_keeps_its_bitmaps() {
+        let mut cache = PageCache::new(1000);
+        cache.insert(key(0), 0, 10);
+        cache.insert(CacheKey::new(0, 2.0), 2, 10);
+        cache.invalidate_zoom(2.0);
+        assert_eq!(cache.get(CacheKey::new(0, 2.0)), Some(&2));
+        assert_eq!(cache.get(key(0)), None);
+    }
+
+    #[test]
+    fn clearing_drops_every_entry() {
+        let mut cache = PageCache::new(1000);
+        cache.insert(key(0), 0, 10);
+        cache.insert(CacheKey::new(0, 2.0), 2, 10);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(cache.get(key(0)), None);
+        assert_eq!(cache.get(CacheKey::new(0, 2.0)), None);
     }
 
     #[test]

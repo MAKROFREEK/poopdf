@@ -150,6 +150,7 @@ pub fn ensure_dynamic_library(
         return Ok(provision_paths(dir, os).0);
     }
     std::fs::create_dir_all(dir).map_err(PdfiumEnsureError::Io)?;
+    eprintln!("poopdf: downloading pinned pdfium ({PINNED_TAG}) — one-time, no configuration needed");
     let bytes = fetcher
         .fetch(&download_url(PINNED_TAG, asset))
         .map_err(PdfiumEnsureError::Io)?;
