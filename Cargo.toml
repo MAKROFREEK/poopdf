@@ -2,5 +2,15 @@
 name = "poopdf"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
+# Pinned pdfium binaries: chromium/8125 (see src/pdfium_lib.rs); pdfium_7881 is the
+# newest API feature set in pdfium-render and is a subset of build 8125's exports.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["thread_safe", "pdfium_7881"] }
+rfd = "0.17"
+dirs = "6"
+flate2 = "1"
+tar = "0.4"
+ureq = { version = "2", default-features = false, features = ["tls"] }
