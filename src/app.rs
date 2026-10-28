@@ -24,6 +24,7 @@ use eframe::egui;
 use egui::{Align2, ColorImage, Event, Key, TextureHandle, Vec2};
 
 use crate::document::Document;
+use crate::navigation::{Event as NavEvent, Geometry, Navigator, StripRect};
 use crate::page_cache::{CacheKey, DEFAULT_BUDGET_BYTES, PageCache};
 use crate::pdfium_lib;
 use crate::view::PageLayout;
@@ -34,7 +35,8 @@ pub struct PdfApp {
     document: Option<Document>,
     error: Option<String>,
     zoom: Zoom,
-    scroll_y: f32,
+    /// Paragraph Cursor, Hover Highlight, selection, and the scroll offset.
+    navigator: Navigator,
     cache: PageCache<TextureHandle>,
     /// File name most recently applied to the window title.
     last_applied_title: Option<String>,
@@ -44,12 +46,13 @@ impl PdfApp {
     /// Provision pdfium once, then create the app. A CLI path opens the
     /// Document immediately; on failure we show the error in-app.
     pub fn new(start_path: Option<String>) -> Result<Self, pdfium_lib::BindError> {
-        let pdfium = pdfium_lib::bind_pinned_pdfium()?;        let mut app = Self {
+        let pdfium = pdfium_lib::bind_pinned_pdfium()?;
+        let mut app = Self {
             pdfium,
             document: None,
             error: None,
             zoom: Zoom::default(),
-            scroll_y: 0.0,
+            navigator: Navigator::new(),
             cache: PageCache::new(DEFAULT_BUDGET_BYTES),
             last_applied_title: None,
         };
@@ -63,13 +66,23 @@ impl PdfApp {
     fn open_document(&mut self, path: &Path) {
         match Document::open(self.pdfium, path) {
             Ok(document) => {
+                // Extract the text layer up front. A failure is surfaced but
+                // does not block opening: the Document stays viewable, just
+                // with no Paragraphs to navigate.
+                let extraction = document.paragraphs();
                 self.document = Some(document);
                 self.error = None;
                 self.zoom = Zoom::default();
-                self.scroll_y = 0.0;
                 // The cached bitmaps belong to the previous Document; drop
                 // all of them, not just other zooms.
                 self.cache.clear();
+                match extraction {
+                    Ok(paragraphs) => self.navigator.set_paragraphs(paragraphs),
+                    Err(e) => {
+                        self.navigator.set_paragraphs(Vec::new());
+                        self.error = Some(format!("Could not read text of {}: {e}", path.display()));
+                    }
+                }
             }
             Err(e) => self.error = Some(format!("Could not open {}: {e}", path.display())),
         }
@@ -98,16 +111,38 @@ impl PdfApp {
         PageLayout::new(&heights, document.page_spacing_points)
     }
 
+    /// View geometry for the navigation core: the strip's page tops and
+    /// rendered sizes at the current zoom, plus the viewport, all in logical
+    /// pixels. `set_geometry` re-clamps the scroll offset as a side effect.
+    fn geometry(&self, viewport: Vec2) -> Geometry {
+        let layout = self.layout();
+        let zoom = self.zoom.factor();
+        Geometry {
+            page_tops: (0..layout.len()).map(|i| layout.top(i)).collect(),
+            page_sizes: match &self.document {
+                Some(document) => document
+                    .page_sizes_points
+                    .iter()
+                    .map(|&(w, h)| (w * zoom, h * zoom))
+                    .collect(),
+                None => Vec::new(),
+            },
+            zoom,
+            viewport: (viewport.x, viewport.y),
+        }
+    }
+
     /// Apply a zoom change, keeping whatever sits at the viewport center in
     /// place; cached bitmaps of the old zoom are dropped.
     fn apply_zoom(&mut self, factor: f32, viewport: Vec2) {
         if factor == self.zoom.factor() {
             return;
         }
+        let scroll_y = self.navigator.scroll_y();
         let old_layout = self.layout();
-        let page_i = old_layout.current_page(self.scroll_y, viewport.y);
+        let page_i = old_layout.current_page(scroll_y, viewport.y);
         let fraction = if old_layout.height(page_i) > 0.0 {
-            (self.scroll_y + viewport.y / 2.0 - old_layout.top(page_i)) / old_layout.height(page_i)
+            (scroll_y + viewport.y / 2.0 - old_layout.top(page_i)) / old_layout.height(page_i)
         } else {
             0.0
         }
@@ -115,38 +150,62 @@ impl PdfApp {
         self.zoom = Zoom::new(factor);
         self.cache.invalidate_zoom(self.zoom.factor());
         let new_layout = self.layout();
-        self.scroll_y = new_layout.anchor_scroll(page_i, fraction, viewport.y);
+        self.navigator.set_geometry(self.geometry(viewport));
+        self.navigator
+            .set_scroll(new_layout.anchor_scroll(page_i, fraction, viewport.y));
     }
 
     /// The page number to show in the indicator ("Page N / total"), 1-based.
     fn current_page_number(&self, viewport: Vec2) -> usize {
-        self.layout().current_page(self.scroll_y, viewport.y) + 1
+        let scroll_y = self.navigator.scroll_y();
+        self.layout().current_page(scroll_y, viewport.y) + 1
     }
 
-    fn viewport_size(ctx: &egui::Context) -> Vec2 {
-        ctx.input(|i| i.content_rect().size())
-    }
-}
+    /// Feed one frame's input — keys, wheel, pointer, click — to the app,
+    /// against the CentralPanel's exact rect (the Control Bar strip above
+    /// it is not part of the viewport).
+    ///
+    /// This runs from `ui`, not from `eframe::App::logic`: eframe also
+    /// calls `logic` while the window is hidden, where egui's input still
+    /// holds the last shown frame's events — keys handled there would fire
+    /// again — and `logic` only saw `content_rect`, about one Control Bar
+    /// taller than the visible panel, leaving a revealed Paragraph Cursor
+    /// slightly below the bottom.
+    fn feed_input(&mut self, ui: &egui::Ui, panel_rect: egui::Rect) {
+        let viewport = panel_rect.size();
 
-impl eframe::App for PdfApp {
-    /// Input handling: keys and wheel. No painting here.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let viewport = Self::viewport_size(ctx);
+        // Fresh geometry before any event lands: the navigation core needs
+        // this frame's page tops, sizes, and viewport to clamp the scroll
+        // offset and to hit-test against.
+        self.navigator.set_geometry(self.geometry(viewport));
 
-        ctx.input(|i| {
+        ui.input(|i| {
             // Shift is part of typing `+`/`_`/text; it must not disable
-            // plain keys. Ctrl/Alt/Command mean shortcuts (Ctrl+wheel, and
-            // keybinds arriving in later tickets).
+            // plain keys. Ctrl/Alt/Command mean shortcuts (Ctrl+wheel,
+            // Ctrl+d/u, and keybinds).
             let unmodified = !(i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command);
             if !unmodified {
                 if i.modifiers.ctrl && i.smooth_scroll_delta.y != 0.0 {
                     // Ctrl+wheel zooms, anchored at the viewport center.
                     self.apply_zoom(self.zoom.wheel(i.smooth_scroll_delta.y).factor(), viewport);
                 }
+                // Ctrl+d / Ctrl+u scroll half a viewport. Alt/Command chords
+                // stay reserved for the system and are ignored.
+                if i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command {
+                    for event in &i.events {
+                        if let Event::Key { key, pressed: true, .. } = event {
+                            match key {
+                                Key::D => self.navigator.handle(NavEvent::HalfPageDown),
+                                Key::U => self.navigator.handle(NavEvent::HalfPageUp),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 return;
             }
 
-            self.scroll_y -= i.smooth_scroll_delta.y;
+            self.navigator.handle(NavEvent::ScrollBy(-i.smooth_scroll_delta.y));
 
             for event in &i.events {
                 if let Event::Key {
@@ -168,20 +227,51 @@ impl eframe::App for PdfApp {
                         }
                         Key::Num0 => self.apply_zoom(self.zoom.reset().factor(), viewport),
                         Key::O => self.open_with_picker(),
-                        Key::Q => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        // Arrows scroll half a viewport; the spec reserves
-                        // `j`/`k`/arrows for the Paragraph Cursor (later
-                        // tickets), so this stays scroll-only.
-                        Key::ArrowDown => self.scroll_y += viewport.y * 0.5,
-                        Key::ArrowUp => self.scroll_y -= viewport.y * 0.5,
+                        Key::Q => ui
+                            .ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Close),
+                        // Paragraph Cursor movement along the Reading Order;
+                        // the Navigator scrolls to keep it in view.
+                        Key::J | Key::ArrowDown => self.navigator.handle(NavEvent::CursorDown),
+                        Key::K | Key::ArrowUp => self.navigator.handle(NavEvent::CursorUp),
+                        // `g` to the top of the Reading Order, `G` (shifted)
+                        // to the bottom.
+                        Key::G if modifiers.shift => self.navigator.handle(NavEvent::JumpBottom),
+                        Key::G => self.navigator.handle(NavEvent::JumpTop),
+                        Key::Escape => self.navigator.handle(NavEvent::ClearSelection),
                         _ => {}
                     }
                 }
             }
         });
-    }
 
-    /// Painting: page indicator strip and the page bitmaps.
+        // The core sees the pointer before anything is painted. Pointer
+        // coordinates are panel-relative, so the core adds scroll itself
+        // when hit-testing. Positions outside the panel are ignored.
+        let top_left = panel_rect.min;
+        let to_local = |pos: egui::Pos2| (pos.x - top_left.x, pos.y - top_left.y);
+        let hover = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|pos| panel_rect.contains(*pos));
+        self.navigator.handle(NavEvent::PointerMove(hover.map(to_local)));
+        let click = ui
+            .input(|i| {
+                i.pointer
+                    .primary_clicked()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            })
+            .filter(|pos| panel_rect.contains(*pos));
+        if let Some(pos) = click {
+            self.navigator.handle(NavEvent::Click(to_local(pos)));
+        }
+    }
+}
+
+impl eframe::App for PdfApp {
+    /// Painting: page indicator strip and the page bitmaps. Also feeds the
+    /// frame's input to the core, right after the layout is known, so keys,
+    /// wheel, pointer, and click all act on the same viewport geometry.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Keep the window title in step with the open Document.
         let wanted_title = self
@@ -221,7 +311,12 @@ impl eframe::App for PdfApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let Some(document) = &self.document else {
+            let panel_rect = ui.max_rect();
+            // Input feeding comes before the Empty State early-return so
+            // `o`/`q`/zoom work with no Document open.
+            self.feed_input(ui, panel_rect);
+
+            if self.document.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("poopdf");
@@ -229,19 +324,22 @@ impl eframe::App for PdfApp {
                     });
                 });
                 return;
-            };
-            let viewport = ui.max_rect().size();
+            }
+
+            let viewport = panel_rect.size();
+            let top_left = panel_rect.min;
+
+            let view = self.navigator.view_model();
+            let scroll_y = view.scroll_y;
+
+            let document = self.document.as_ref().expect("checked above");
             let layout = self.layout();
             let zoom = self.zoom.factor();
-            let top_left = ui.max_rect().min;
-
-            self.scroll_y = layout.clamp_scroll(self.scroll_y, viewport.y);
 
             let painter = ui.painter().clone();
             for page_i in 0..document.page_count() {
                 let page_top = layout.top(page_i);
-                if page_top > self.scroll_y + viewport.y
-                    || page_top + layout.height(page_i) < self.scroll_y
+                if page_top > scroll_y + viewport.y || page_top + layout.height(page_i) < scroll_y
                 {
                     continue; // off-screen
                 }
@@ -249,7 +347,7 @@ impl eframe::App for PdfApp {
                 let size = Vec2::new(w_points * zoom, h_points * zoom);
                 let min = egui::pos2(
                     top_left.x + (viewport.x - size.x) / 2.0,
-                    top_left.y - self.scroll_y + page_top,
+                    top_left.y - scroll_y + page_top,
                 );
                 let rect = egui::Rect::from_min_size(min, size);
 
@@ -297,6 +395,50 @@ impl eframe::App for PdfApp {
                         egui::StrokeKind::Inside,
                     );
                 }
+            }
+
+            // Highlight boxes ride the strip: screen = panel top-left +
+            // (strip position - scroll). The closures capture only Copy
+            // values, so mapping with them by value is fine.
+            let to_screen = |r: StripRect| {
+                egui::Rect::from_min_size(
+                    egui::pos2(top_left.x + r.x, top_left.y + r.y - scroll_y),
+                    egui::vec2(r.w, r.h),
+                )
+            };
+            // Selection first, so the cursor and hover outlines stay on top
+            // of its fill.
+            if let Some(rect) = view.selected.map(to_screen) {
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(40, 110, 240, 45),
+                );
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(40, 110, 240)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            // Hover Highlight: the Paragraph under the pointer.
+            if let Some(rect) = view.hovered.map(to_screen) {
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 150, 200)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            // Paragraph Cursor: the thickest, warmest box — where keyboard
+            // navigation currently sits.
+            if let Some(rect) = view.cursor.map(to_screen) {
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 150, 0)),
+                    egui::StrokeKind::Outside,
+                );
             }
         });
     }

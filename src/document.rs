@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use pdfium_render::prelude::*;
 
+use crate::paragraphs::{group_into_paragraphs, CharBox, Paragraph, Rect};
+
 /// One rendered page: straight-alpha RGBA, row-major, top-left origin.
 #[derive(Debug, Clone)]
 pub struct PageBitmap {
@@ -68,6 +70,40 @@ impl Document {
 
     pub fn page_count(&self) -> usize {
         self.page_sizes_points.len()
+    }
+
+    /// Every page's text as Paragraphs in Reading Order: pdfium's character
+    /// boxes are flipped into the viewer's top-left-origin page points, then
+    /// grouped by the platform-free rules in [`group_into_paragraphs`].
+    pub fn paragraphs(&self) -> Result<Vec<Paragraph>, PdfiumError> {
+        let mut all = Vec::new();
+        for page_index in 0..self.page_count() {
+            let page = self.document.pages().get(page_index as PdfPageIndex)?;
+            let page_height = page.height().value;
+            let text = page.text()?;
+
+            let mut chars = Vec::new();
+            for c in text.chars().iter() {
+                // Unmapped glyphs (unicode value 0) carry no text to read;
+                // dropping them keeps runs of them from splitting words.
+                let Some(ch) = c.unicode_char() else { continue };
+                let bounds = c.loose_bounds()?;
+                chars.push(CharBox {
+                    ch,
+                    // pdfium's page space has its origin bottom-left with y
+                    // growing up; the viewer paints top-left with y growing
+                    // down, so y is measured from the page's top edge.
+                    rect: Rect {
+                        x: bounds.left().value,
+                        y: page_height - bounds.top().value,
+                        w: bounds.right().value - bounds.left().value,
+                        h: bounds.top().value - bounds.bottom().value,
+                    },
+                });
+            }
+            all.extend(group_into_paragraphs(page_index, &chars));
+        }
+        Ok(all)
     }
 
     /// Render page `page` to an RGBA bitmap at the given zoom

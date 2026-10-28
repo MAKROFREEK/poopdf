@@ -21,7 +21,9 @@
 
 pub mod app;
 pub mod document;
+pub mod navigation;
 pub mod page_cache;
+pub mod paragraphs;
 pub mod pdfium_lib;
 pub mod view;
 pub mod zoom;
